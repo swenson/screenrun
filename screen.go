@@ -18,16 +18,16 @@ import (
 	"github.com/kr/pty"
 )
 
-var url = "ws://localhost:8080/tty?id="
-var viewUrl = "http://localhost:8080/view?id="
+var devURL = "ws://localhost:8080/tty?id="
+var prodURL = "wss://screen.run/tty?id="
+var viewDevURL = "http://localhost:8080/view?id="
+var viewProdURL = "https://screen.run/view?id="
+
 var protocol = "uploadtty"
 
 var endian = binary.LittleEndian
 
 const term = "screen"
-
-const DefaultEsc = 'a' & 037
-const DefaultMetaEsc = 'a' & 037
 const msgVersion = 5
 const msgRevision = ('m' << 24) | ('s' << 16) | ('g' << 8) | msgVersion
 const msgCreate = 0
@@ -50,22 +50,15 @@ const maxTermLen = 32
 const dataSize = 2340
 const messageSize = 3372
 
+const sigLock = syscall.SIGUSR2
+const sigBye = syscall.SIGHUP
+const sigPowerBye = syscall.SIGUSR1
+
 type screenMessage struct {
 	ProtocolRevision uint32
 	Type             uint32
 	Mtty             [maxPathLen]byte
 	Data             [dataSize]byte
-}
-
-type screenMessageCreate struct {
-	Lflag      uint32
-	Aflag      bool
-	Flowflag   uint32
-	Hheight    uint32
-	Nargs      uint32
-	Line       [maxPathLen]byte
-	Dir        [maxPathLen]byte
-	Screenterm [maxTermLen + 1]byte
 }
 
 type screenMessageAttach struct {
@@ -102,71 +95,9 @@ func serialize(m *screenMessage, data interface{}) []byte {
 	return dest
 }
 
-type screenMessageDetach struct {
-	Duser [maxLoginLen + 1]byte
-	Dpid  int32
-}
-
-type screenMessageCommand struct {
-	Auser     [maxLoginLen + 1]byte
-	padding   [(4 - ((maxLoginLen + 1) % 4)) % 4]byte
-	Nargs     uint32
-	Cmd       [maxPathLen + 1]byte
-	padding2  [(4 - ((maxPathLen + 1) % 4)) % 4]byte
-	Apid      int32
-	Preselect [20]byte
-	Writeback [maxPathLen]byte
-}
-
 type screenMessageMessage [2048]byte
 
-// here is the original GNU screen message struct:
-//
-// typedef struct Message Message;
-// struct Message {
-// 	int protocol_revision;	/* reduce harm done by incompatible messages */
-// 	int type;
-// 	char m_tty[MAXPATHLEN];	/* ttyname */
-// 	union {
-// 		struct {
-// 			int lflag;
-// 			bool aflag;
-// 			int flowflag;
-// 			int hheight;			/* size of scrollback buffer */
-// 			int nargs;
-// 			char line[MAXPATHLEN];
-// 			char dir[MAXPATHLEN];
-// 			char screenterm[MAXTERMLEN + 1];/* is screen really "screen" ? */
-// 		} create;
-// 		struct {
-// 			char auser[MAXLOGINLEN + 1];	/* username */
-// 			pid_t apid;			/* pid of frontend */
-// 			int adaptflag;			/* adapt window size? */
-// 			int lines, columns;		/* display size */
-// 			char preselect[20];
-// 			int esc;			/* his new escape character unless -1 */
-// 			int meta_esc;			/* his new meta esc character unless -1 */
-// 			char envterm[MAXTERMLEN + 1];	/* terminal type */
-// 			int encoding;			/* encoding of display */
-// 			int detachfirst;		/* whether to detach remote sessions first */
-// 		} attach;
-// 		struct {
-// 			char duser[MAXLOGINLEN + 1];	/* username */
-// 			pid_t dpid;			/* pid of frontend */
-// 		} detach;
-// 		struct {
-// 			char auser[MAXLOGINLEN + 1];	/* username */
-// 			int nargs;
-// 			char cmd[MAXPATHLEN + 1];	/* command */
-// 			pid_t apid;		/* pid of frontend */
-// 			char preselect[20];
-// 			char writeback[MAXPATHLEN];	/* The socket to write the result.
-// 							   Only used for MSG_QUERY */
-// 			} command;
-// 		char message[MAXPATHLEN * 2];
-// 	} m;
-// };
-
+// write a message to the screen socket
 func write(m *screenMessage, data interface{}) {
 	c, err := net.Dial("unix", os.Args[1])
 	if err != nil {
@@ -181,32 +112,87 @@ func write(m *screenMessage, data interface{}) {
 	}
 }
 
-func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("screenrun plays GNU screen sessions on a remote web server")
-		fmt.Println("usage: ./screenrun screenfile")
-		fmt.Println("\nExample: ./screenrun $HOME/.screen/*   # picks up the first screen")
-		os.Exit(1)
+func forwardTty(pt *os.File, conn *websocket.Conn) {
+	last := time.Now().UnixNano()
+	buffer := make([]byte, 1024)
+	for {
+		n, err := pt.Read(buffer[12:])
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		if n == 0 {
+			time.Sleep(1 * time.Millisecond)
+		}
+		now := time.Now().UnixNano()
+		diff := now - last
+		diffSeconds := int32(diff / 1e9)
+		diffMicros := int32((diff / 100) % 1e6)
+		// unlilkey, but time is weird
+		if diffMicros < 0 {
+			diffMicros += 1e6
+		}
+		binary.Write(bytes.NewBuffer(buffer[:0]), binary.LittleEndian, diffSeconds)
+		binary.Write(bytes.NewBuffer(buffer[:4]), binary.LittleEndian, diffMicros)
+		binary.Write(bytes.NewBuffer(buffer[:8]), binary.LittleEndian, int32(n))
+		w, err := conn.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		w.Write(buffer[:n+12])
+		w.Close()
+		last = now
 	}
+}
 
-	pt, file, err := pty.Open()
-	if err != nil {
-		panic(err)
+func signalHandler(ch chan os.Signal, termFile *os.File, cont chan bool, closed chan bool) {
+	for {
+		sig := <-ch
+		if sig == syscall.SIGINT {
+			fmt.Println("Caught SIGINT, shutting down")
+			// close everything gracefully
+			termFile.Close()
+			closed <- true
+			continue
+		}
+
+		if sig == syscall.SIGCONT {
+			signal.Reset(syscall.SIGCONT)
+			cont <- true
+			continue
+		}
+
+		if sig == syscall.SIGHUP {
+			closed <- true
+			os.Exit(0)
+		}
+		fmt.Printf("Unknown signal %v\n", sig)
 	}
+}
 
-	defer file.Close()
-	defer pt.Close()
+// process close messages and discard others
+func processWebsocketIncoming(conn *websocket.Conn, closed chan bool) {
+	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			fmt.Printf("WebSocket returned %v\n", err)
+			conn.Close()
+			break
+		}
+	}
+	closed <- true
+}
 
+func attach(termFile *os.File) {
 	u, err := user.Current()
 	if err != nil {
 		panic(err)
 	}
-
 	m := new(screenMessage)
 	m.ProtocolRevision = msgRevision
 	m.Type = msgAttach
-	copy(m.Mtty[:], []byte(file.Name()))
-	m.Mtty[len(file.Name())] = 0
+	copy(m.Mtty[:], []byte(termFile.Name()))
+	m.Mtty[len(termFile.Name())] = 0
 	attach := screenMessageAttach{
 		Apid:        int32(os.Getpid()),
 		Esc:         -1,
@@ -220,69 +206,74 @@ func main() {
 	attach.Auser[len(u.Name)] = 0
 	copy(attach.Envterm[:], []byte(term))
 	attach.Envterm[len(term)] = 0
-	ch := make(chan os.Signal)
-
-	const SIG_LOCK = syscall.SIGUSR2
-	const SIG_BYE = syscall.SIGHUP
-	const SIG_POWER_BYE = syscall.SIGUSR1
-	signal.Notify(ch, SIG_BYE, SIG_POWER_BYE, SIG_LOCK, syscall.SIGINT, syscall.SIGWINCH, syscall.SIGSTOP, syscall.SIGALRM, syscall.SIGCONT)
-
-	var conn *websocket.Conn
-
-	cont := make(chan bool)
-	go func() {
-		for {
-			sig := <-ch
-			if sig == syscall.SIGINT {
-				fmt.Println("Caught SIGINT, shutting down")
-				// close everything gracefully
-				file.Close()
-				if conn != nil {
-					w, err := conn.NextWriter(websocket.CloseMessage)
-					if err != nil {
-						fmt.Printf("Error: %v\n", err)
-						os.Exit(1)
-					}
-					w.Write(websocket.FormatCloseMessage(websocket.CloseNormalClosure, "SIGINT"))
-					w.Close()
-				}
-				os.Exit(0)
-			}
-
-			if sig == syscall.SIGCONT {
-				signal.Reset(syscall.SIGCONT)
-				cont <- true
-				continue
-			}
-
-			if sig == syscall.SIGHUP {
-				// close connection gracefully
-				if conn != nil {
-					conn.Close()
-				}
-				os.Exit(0)
-			}
-			fmt.Printf("Unknown signal %v\n", sig)
-		}
-	}()
-
-	fmt.Printf("Connecting to screen %s...\n", os.Args[1])
 	write(m, attach)
-	<-cont
-	fmt.Printf("Connected\n")
+}
 
+func url() string {
+	if os.Getenv("ENV") == "prod" {
+		return prodURL
+	}
+	return devURL
+}
+
+func viewURL() string {
+	if os.Getenv("ENV") == "prod" {
+		return viewProdURL
+	}
+	return viewDevURL
+}
+
+func newID() string {
 	buffer := make([]byte, 15)
 	rand.Read(buffer)
 	id := base32.StdEncoding.EncodeToString(buffer)
+	return id
+}
 
+func newWebSocket(id string) *websocket.Conn {
 	headers := http.Header{}
 	hostname, _ := os.Hostname()
 	headers.Add("Origin", hostname)
 	headers.Add("Sec-WebSocket-Protocol", protocol)
-	conn, _, err = websocket.DefaultDialer.Dial(url+id, headers)
+	conn, _, err := websocket.DefaultDialer.Dial(url()+id, headers)
 	if err != nil {
 		panic(err)
 	}
+	return conn
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Println("screenrun plays GNU screen sessions on a remote web server")
+		fmt.Println("usage: ./screenrun screenfile")
+		fmt.Println("\nExample: ./screenrun $HOME/.screen/*   # picks up the first screen")
+		os.Exit(1)
+	}
+
+	pt, termFile, err := pty.Open()
+	if err != nil {
+		panic(err)
+	}
+
+	defer termFile.Close()
+	defer pt.Close()
+
+	ch := make(chan os.Signal)
+
+	signal.Notify(ch, sigBye, sigPowerBye, sigLock, syscall.SIGINT, syscall.SIGWINCH, syscall.SIGSTOP, syscall.SIGALRM, syscall.SIGCONT)
+
+	cont := make(chan bool)
+	closed := make(chan bool)
+	go signalHandler(ch, termFile, cont, closed)
+
+	fmt.Printf("Attaching to screen %s...\n", os.Args[1])
+	attach(termFile)
+	<-cont
+	fmt.Printf("Attached\n")
+
+	id := newID()
+
+	conn := newWebSocket(id)
 
 	// wait for a message from the server to know that it is setup
 	_, _, err = conn.ReadMessage()
@@ -290,51 +281,13 @@ func main() {
 		panic(err)
 	}
 
-	last := time.Now().UnixNano()
+	go forwardTty(pt, conn)
 
-	go func() {
-		buffer := make([]byte, 1024)
-		for {
-			n, err := pt.Read(buffer[12:])
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				os.Exit(1)
-			}
-			if n == 0 {
-				time.Sleep(1 * time.Millisecond)
-			}
-			now := time.Now().UnixNano()
-			diff := now - last
-			diffSeconds := int32(diff / 1e9)
-			diffMicros := int32((diff / 100) % 1e6)
-			// unlilkey, but time is weird
-			if diffMicros < 0 {
-				diffMicros += 1e6
-			}
-			binary.Write(bytes.NewBuffer(buffer[:0]), binary.LittleEndian, diffSeconds)
-			binary.Write(bytes.NewBuffer(buffer[:4]), binary.LittleEndian, diffMicros)
-			binary.Write(bytes.NewBuffer(buffer[:8]), binary.LittleEndian, int32(n))
-			w, err := conn.NextWriter(websocket.BinaryMessage)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				os.Exit(1)
-			}
-			w.Write(buffer[:n+12])
-			w.Close()
-			last = now
-		}
-	}()
+	fmt.Printf("View at %s\n", viewURL()+id)
 
-	fmt.Printf("View at %s\n", viewUrl+id)
+	go processWebsocketIncoming(conn, closed)
 
-	// process close messages and discard others
-	for {
-		if _, _, err := conn.NextReader(); err != nil {
-			fmt.Printf("WebSocket returned %v\n", err)
-			conn.Close()
-			break
-		}
-	}
-	// our connection closed
+	// wait for the connection to close
+	<-closed
 	os.Exit(0)
 }
