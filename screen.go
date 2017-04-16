@@ -28,6 +28,28 @@ var protocol = "uploadtty"
 var endian = binary.LittleEndian
 
 const term = "screen"
+
+// these are platform-dependent :/
+
+// MacOS 10.12, 64-bit
+const maxPathLen = 1024
+const maxLoginLen = 256
+const maxTermLen = 32
+const dataSize = 2340
+const messageSize = 3372
+
+// ubuntu 16.04 x86-64
+// MAXPATHLEN 4096
+// MAXLOGINLEN 256
+// MAXTERMLEN 32
+// message 12588
+// create 8248
+// attach 348
+// detach 264
+// command 8484
+// message 8192
+// msgVersion = 0
+
 const msgVersion = 5
 const msgRevision = ('m' << 24) | ('s' << 16) | ('g' << 8) | msgVersion
 const msgCreate = 0
@@ -40,15 +62,6 @@ const msgWinch = 6
 const msgHangup = 7
 const msgCommand = 8
 const msgQuery = 9
-
-// these are platform-dependent :/
-
-// MacOS 10.12, 64-bit
-const maxPathLen = 1024
-const maxLoginLen = 256
-const maxTermLen = 32
-const dataSize = 2340
-const messageSize = 3372
 
 const sigLock = syscall.SIGUSR2
 const sigBye = syscall.SIGHUP
@@ -210,17 +223,17 @@ func attach(termFile *os.File) {
 }
 
 func url() string {
-	if os.Getenv("ENV") == "prod" {
-		return prodURL
+	if os.Getenv("ENV") == "dev" {
+		return devURL
 	}
-	return devURL
+	return prodURL
 }
 
 func viewURL() string {
-	if os.Getenv("ENV") == "prod" {
-		return viewProdURL
+	if os.Getenv("ENV") == "dev" {
+		return viewDevURL
 	}
-	return viewDevURL
+	return viewProdURL
 }
 
 func newID() string {
