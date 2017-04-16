@@ -6,7 +6,7 @@ import (
 )
 
 func TestMagic(t *testing.T) {
-	magic := 1836279556
+	magic := 1836279557
 	if magic != msgRevision {
 		t.Errorf("Expected msgRevision to be %d, got %d", magic, msgRevision)
 	}

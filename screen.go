@@ -2,18 +2,25 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"os/user"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/kr/pty"
 )
+
+var url = "ws://localhost:8080/tty?id="
+var viewUrl = "http://localhost:8080/view?id="
+var protocol = "uploadtty"
 
 var endian = binary.LittleEndian
 
@@ -21,7 +28,7 @@ const term = "screen"
 
 const DefaultEsc = 'a' & 037
 const DefaultMetaEsc = 'a' & 037
-const msgVersion = 4
+const msgVersion = 5
 const msgRevision = ('m' << 24) | ('s' << 16) | ('g' << 8) | msgVersion
 const msgCreate = 0
 const msgError = 1
@@ -161,51 +168,35 @@ type screenMessageMessage [2048]byte
 // };
 
 func write(m *screenMessage, data interface{}) {
-	c, err := net.Dial("unix", os.Args[1]) // linux
-	// c, err := os.OpenFile(os.Args[1], os.O_RDWR, os.ModeNamedPipe) // mac
+	c, err := net.Dial("unix", os.Args[1])
 	if err != nil {
 		panic(err)
 	}
 	defer c.Close()
 
 	out := serialize(m, data)
-	fmt.Printf("Sent: %v\n\n\n", out)
 	_, err = c.Write(out)
 	if err != nil {
 		panic(err)
 	}
 }
-func read() {
-	// c, err := net.Dial("unix", os.Args[1]) // linux
-	c, err := os.OpenFile(os.Args[1], os.O_RDWR, os.ModeNamedPipe) // mac
-	if err != nil {
-		panic(err)
-	}
-	defer c.Close()
-	buffer := make([]byte, messageSize+1)
-	n, err := c.Read(buffer)
-	fmt.Printf("Read %d bytes\n", n)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("Got %v\n", buffer[:n])
-	if n != messageSize {
-		fmt.Printf("Expected %d bytes in frame, got >= %d", messageSize, n)
-	}
-}
 
 func main() {
+	if len(os.Args) != 2 {
+		fmt.Println("screenrun plays GNU screen sessions on a remote web server")
+		fmt.Println("usage: ./screenrun screenfile")
+		fmt.Println("\nExample: ./screenrun $HOME/.screen/*   # picks up the first screen")
+		os.Exit(1)
+	}
 
 	pt, file, err := pty.Open()
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("pt %s\nfile %s\n", pt.Name(), file.Name())
 	defer file.Close()
 	defer pt.Close()
 
-	fmt.Printf("arg: %s\n", os.Args[1])
 	u, err := user.Current()
 	if err != nil {
 		panic(err)
@@ -214,16 +205,16 @@ func main() {
 	m := new(screenMessage)
 	m.ProtocolRevision = msgRevision
 	m.Type = msgAttach
-	// copy(m.Mtty[:], []byte(pt.Name()))
 	copy(m.Mtty[:], []byte(file.Name()))
 	m.Mtty[len(file.Name())] = 0
-	fmt.Printf("pid %d\n", os.Getpid())
 	attach := screenMessageAttach{
 		Apid:        int32(os.Getpid()),
 		Esc:         -1,
 		MetaEsc:     -1,
 		Detachfirst: msgAttach,
-		Adaptflag:   1,
+		Adaptflag:   0,
+		Lines:       50,
+		Columns:     132,
 	}
 	copy(attach.Auser[:], []byte(u.Username))
 	attach.Auser[len(u.Name)] = 0
@@ -236,32 +227,75 @@ func main() {
 	const SIG_POWER_BYE = syscall.SIGUSR1
 	signal.Notify(ch, SIG_BYE, SIG_POWER_BYE, SIG_LOCK, syscall.SIGINT, syscall.SIGWINCH, syscall.SIGSTOP, syscall.SIGALRM, syscall.SIGCONT)
 
+	var conn *websocket.Conn
+
 	cont := make(chan bool)
 	go func() {
 		for {
 			sig := <-ch
-			fmt.Printf("Got signal %v\n", sig)
 			if sig == syscall.SIGINT {
-				os.Exit(1)
+				fmt.Println("Caught SIGINT, shutting down")
+				// close everything gracefully
+				file.Close()
+				if conn != nil {
+					w, err := conn.NextWriter(websocket.CloseMessage)
+					if err != nil {
+						fmt.Printf("Error: %v\n", err)
+						os.Exit(1)
+					}
+					w.Write(websocket.FormatCloseMessage(websocket.CloseNormalClosure, "SIGINT"))
+					w.Close()
+				}
+				os.Exit(0)
 			}
 
 			if sig == syscall.SIGCONT {
 				signal.Reset(syscall.SIGCONT)
 				cont <- true
+				continue
 			}
 
 			if sig == syscall.SIGHUP {
+				// close connection gracefully
+				if conn != nil {
+					conn.Close()
+				}
 				os.Exit(0)
 			}
+			fmt.Printf("Unknown signal %v\n", sig)
 		}
 	}()
 
+	fmt.Printf("Connecting to screen %s...\n", os.Args[1])
 	write(m, attach)
 	<-cont
+	fmt.Printf("Connected\n")
+
+	buffer := make([]byte, 15)
+	rand.Read(buffer)
+	id := base32.StdEncoding.EncodeToString(buffer)
+
+	headers := http.Header{}
+	hostname, _ := os.Hostname()
+	headers.Add("Origin", hostname)
+	headers.Add("Sec-WebSocket-Protocol", protocol)
+	conn, _, err = websocket.DefaultDialer.Dial(url+id, headers)
+	if err != nil {
+		panic(err)
+	}
+
+	// wait for a message from the server to know that it is setup
+	_, _, err = conn.ReadMessage()
+	if err != nil {
+		panic(err)
+	}
+
+	last := time.Now().UnixNano()
 
 	go func() {
+		buffer := make([]byte, 1024)
 		for {
-			n, err := io.Copy(os.Stdout, pt)
+			n, err := pt.Read(buffer[12:])
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 				os.Exit(1)
@@ -269,9 +303,38 @@ func main() {
 			if n == 0 {
 				time.Sleep(1 * time.Millisecond)
 			}
+			now := time.Now().UnixNano()
+			diff := now - last
+			diffSeconds := int32(diff / 1e9)
+			diffMicros := int32((diff / 100) % 1e6)
+			// unlilkey, but time is weird
+			if diffMicros < 0 {
+				diffMicros += 1e6
+			}
+			binary.Write(bytes.NewBuffer(buffer[:0]), binary.LittleEndian, diffSeconds)
+			binary.Write(bytes.NewBuffer(buffer[:4]), binary.LittleEndian, diffMicros)
+			binary.Write(bytes.NewBuffer(buffer[:8]), binary.LittleEndian, int32(n))
+			w, err := conn.NextWriter(websocket.BinaryMessage)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			w.Write(buffer[:n+12])
+			w.Close()
+			last = now
 		}
 	}()
 
+	fmt.Printf("View at %s\n", viewUrl+id)
+
+	// process close messages and discard others
 	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			fmt.Printf("WebSocket returned %v\n", err)
+			conn.Close()
+			break
+		}
 	}
+	// our connection closed
+	os.Exit(0)
 }
