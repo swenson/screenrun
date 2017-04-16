@@ -14,14 +14,16 @@ communications protocol.
 * **BUG**: Only MacOS is supported. Every operating system has a different protocol, and so far I have only
            done the work to support MacOS with screen 4.4+
 * **BUG**: Emojis (and probably Unicode in general) are lost in one of the terminal emulation layers.
-* **NOTICE**: Obviously, this exports your screen session to the entire world (read-only). The server is
-              SSL-enabled and the id generated should be unguessable.
-
+* **NOTE**: Obviously, this exports your screen session to the entire world (read-only). The server is
+            SSL-enabled and the id generated should be unguessable.
+* **NOTE**: The web terminal is fixed to 132x50. screen does not support resolution negotiation for
+            multi-attach mode very well, so it's probably best if your screen session has resolution
+            lower than or equal to 132x50. (Smaller is fine &mdash; it will just show a dashed border).
 
 ## Install
 
 ```
-go install github.com/swenson/screenrun
+go get github.com/swenson/screenrun
 ```
 
 ## Usage
@@ -54,3 +56,11 @@ Attaching to screen /tmp/uscreens/S-swenson/19561.testing...
 Attached
 View at https://screen.run/view?id=J3TEO54IFLQWJ7ZZILJFJTUM
 ```
+
+## TODOs
+
+* Support Ubuntu
+* Support emojis
+* Save a session to a ttyrec file
+* screen protocol negotiation to discover what kind of screen we are talking to
+* Better website
