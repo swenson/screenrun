@@ -64,3 +64,5 @@ View at https://screen.run/view?id=J3TEO54IFLQWJ7ZZILJFJTUM
 * Save a session to a ttyrec file
 * screen protocol negotiation to discover what kind of screen we are talking to
 * Better website
+* Support tmux
+* Support desktop video capture and save
