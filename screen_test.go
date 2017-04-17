@@ -1,33 +1,36 @@
 package main
 
-import (
-	"testing"
-	"unsafe"
-)
+import "testing"
 
-func TestMagic(t *testing.T) {
-	magic := 1836279557
-	if magic != msgRevision {
-		t.Errorf("Expected msgRevision to be %d, got %d", magic, msgRevision)
+func TestAttachSizes(t *testing.T) {
+	l := len(makeAttachMessage(5, "", 0, 0))
+	if l != 3372 {
+		t.Errorf("Expected version 5 to be 3372, got %d", l)
 	}
-}
 
-func TestStructSizes(t *testing.T) {
-	var size int64
-	{
-		name := "screenMessage"
-		size = 3372
-		value := screenMessage{}
-		if size != int64(unsafe.Sizeof(value)) {
-			t.Errorf("%s should be %d bytes in size, got %d", name, size, unsafe.Sizeof(value))
-		}
+	tests := []struct {
+		os      string
+		version int
+		size    int
+	}{
+		{"darwin", 0, 3372},
+		{"darwin", 1, 3372},
+		{"darwin", 2, 3372},
+		{"darwin", 3, 3372},
+		{"darwin", 4, 3372},
+		{"darwin", 5, 3372},
+		{"linux", 0, 12588},
+		{"linux", 1, 12588},
+		{"linux", 2, 12588},
+		{"linux", 3, 12588},
+		{"linux", 4, 12588},
+		{"linux", 5, 12588},
 	}
-	{
-		name := "screenMessageAttach"
-		size = 348
-		value := screenMessageAttach{}
-		if size != int64(unsafe.Sizeof(value)) {
-			t.Errorf("%s should be %d bytes in size, got %d", name, size, unsafe.Sizeof(value))
+
+	for _, test := range tests {
+		l = messageSize(test.version, FindMaxPathLen(test.os))
+		if l != test.size {
+			t.Errorf("Expected version %d on %s to be %d, got %d", test.version, test.os, test.size, l)
 		}
 	}
 }

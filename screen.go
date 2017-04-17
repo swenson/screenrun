@@ -6,11 +6,13 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"os/user"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -31,12 +33,8 @@ const term = "screen"
 
 // these are platform-dependent :/
 
-// MacOS 10.12, 64-bit
-const maxPathLen = 1024
+// these seem to be constant across many operating systems?
 const maxLoginLen = 256
-const maxTermLen = 32
-const dataSize = 2340
-const messageSize = 3372
 
 // ubuntu 16.04 x86-64
 // MAXPATHLEN 4096
@@ -50,8 +48,28 @@ const messageSize = 3372
 // message 8192
 // msgVersion = 0
 
-const msgVersion = 5
-const msgRevision = ('m' << 24) | ('s' << 16) | ('g' << 8) | msgVersion
+func FindMaxPathLen(os string) int {
+	if os == "" {
+		os = runtime.GOOS
+	}
+	// we have to hardcode because of reasons http://insanecoding.blogspot.com/2007/11/pathmax-simply-isnt.html
+	// we could try to read in syslimits.h or another file, but who knows if they are there
+	// and we don't want to parse C
+	switch os {
+	case "darwin":
+		return 1024
+	case "linux":
+		return 4096
+	// TODO: confirm everything below here
+	case "windows":
+		return 260
+	case "freebsd", "openbsd", "netbsd", "plan9", "solaris", "nacl", "dragonfly", "android":
+		return 1024
+	default:
+		panic("Unknown operating system for max path length")
+	}
+}
+
 const msgCreate = 0
 const msgError = 1
 const msgAttach = 2
@@ -67,59 +85,139 @@ const sigLock = syscall.SIGUSR2
 const sigBye = syscall.SIGHUP
 const sigPowerBye = syscall.SIGUSR1
 
-type screenMessage struct {
-	ProtocolRevision uint32
-	Type             uint32
-	Mtty             [maxPathLen]byte
-	Data             [dataSize]byte
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
-type screenMessageAttach struct {
-	Auser       [maxLoginLen + 1]byte
-	padding     [(4 - ((maxLoginLen + 1) % 4)) % 4]byte
-	Apid        int32
-	Adaptflag   uint32
-	Lines       uint32
-	Columns     uint32
-	Preselect   [20]byte
-	Esc         int32
-	MetaEsc     int32
-	Envterm     [maxTermLen + 1]byte
-	padding2    [(4 - ((maxTermLen + 1) % 4)) % 4]byte
-	Encoding    uint32
-	Detachfirst uint32
+func chop(b []byte, max int) []byte {
+	return b[:min(len(b), max)]
 }
 
-func serialize(m *screenMessage, data interface{}) []byte {
-	dataOut := bytes.NewBuffer(nil)
-	err := binary.Write(dataOut, endian, data)
+func pad(n int) int {
+	switch n % 4 {
+	case 0:
+		return n
+	case 1:
+		return n + 3
+	case 2:
+		return n + 2
+	case 3:
+		return n + 1
+	}
+	return 0 // unreachable
+}
+
+func max(args ...int) int {
+	m := 0
+	for _, arg := range args {
+		if arg > m {
+			m = arg
+		}
+	}
+	return m
+}
+
+var maxTermLen = map[int]int{
+	0: 20,
+	1: 20,
+	2: 20,
+	3: 32,
+	4: 32,
+	5: 32,
+}
+
+func messageSize(version int, pathLen int) int {
+	if pathLen == 0 {
+		pathLen = FindMaxPathLen("")
+	}
+	header := 4 + 4 + pad(pathLen)
+	createSize := 4 + 4 + 4 + 4 + 4 + pad(pathLen)*2 + pad(maxTermLen[version])
+	attachSize0 := pad(maxLoginLen+1) + 4 + 4 + 4 + 4 + pad(20) + 4 + 4 + pad(maxTermLen[version]+1) + 4
+	detachSize := pad(maxLoginLen+1) + 4
+	commandSize := pad(maxLoginLen+1) + 4 + pad(pathLen+1) + 4 + pad(20) + pad(pathLen)
+	messageSize := pad(pathLen * 2)
+	switch version {
+	case 0:
+		return header + max(createSize, attachSize0, detachSize, commandSize, messageSize)
+	case 1, 2, 3, 4:
+		attachSize := attachSize0 + 4
+		return header + max(createSize, attachSize, detachSize, commandSize, messageSize)
+	case 5:
+		createSize5 := 4 + 4 + 4 + 4 + 4 + pad(pathLen)*2 + pad(maxTermLen[version]+1)
+		attachSize := attachSize0 + 4
+		return header + max(createSize5, attachSize, detachSize, commandSize, messageSize)
+	}
+	panic(fmt.Errorf("Unknown screen protocol version %d", version))
+}
+
+func makeAttachMessage(version int, ttyName string, lines int, columns int) []byte {
+	u, err := user.Current()
 	if err != nil {
 		panic(err)
 	}
+	pathLen := FindMaxPathLen("")
+	uname := chop([]byte(u.Username), maxLoginLen)
 
-	copy(m.Data[:], dataOut.Bytes())
+	w := bytes.NewBuffer(nil)
+	tty := chop([]byte(ttyName), pathLen)
 
-	messageOut := bytes.NewBuffer(nil)
-	err = binary.Write(messageOut, endian, *m)
-	if err != nil {
-		panic(err)
+	binary.Write(w, endian, uint32(('m'<<24)|('s'<<16)|('g'<<8)|version))
+	binary.Write(w, endian, uint32(msgAttach))
+	w.Write(tty)
+	w.Write(bytes.Repeat([]byte{0}, pathLen-len(tty)))
+	w.Write(bytes.Repeat([]byte{0}, pad(pathLen)-pathLen))
+	w.Write(uname)
+	w.Write(bytes.Repeat([]byte{0}, pad(maxLoginLen+1)-len(uname)))
+	binary.Write(w, endian, int32(os.Getpid()))
+	binary.Write(w, endian, uint32(0))
+	binary.Write(w, endian, uint32(lines))
+	binary.Write(w, endian, uint32(columns))
+	w.Write(bytes.Repeat([]byte{0}, 20))
+	binary.Write(w, endian, int32(0))
+	binary.Write(w, endian, int32(0))
+	w.WriteString("screen")
+	w.Write(bytes.Repeat([]byte{0}, pad(maxTermLen[version]+1)-6))
+	binary.Write(w, endian, uint32(0))
+
+	switch version {
+	case 0:
+	case 1, 2, 3, 4, 5: // for attach messages these are identical except for maxTermLen identical
+		binary.Write(w, endian, uint32(0)) // version one added detachfirst
+	default:
+		panic(fmt.Sprintf("Unknown screen protocol version %d", version))
 	}
-	dest := messageOut.Bytes()
-	return dest
+	w.Write(bytes.Repeat([]byte{0}, messageSize(version, 0)-len(w.Bytes())))
+	return w.Bytes()
 }
-
-type screenMessageMessage [2048]byte
 
 // write a message to the screen socket
-func write(m *screenMessage, data interface{}) {
-	c, err := net.Dial("unix", os.Args[1])
-	if err != nil {
+func screenSocketWrite(data []byte) {
+	info, err := os.Stat(os.Args[1])
+	if os.IsNotExist(err) {
+		fmt.Printf("File not found: %s\n", os.Args[1])
+		os.Exit(1)
+	} else if err != nil {
 		panic(err)
 	}
+	var c io.WriteCloser
+	if info.Mode()&os.ModeNamedPipe != 0 {
+		c, err = os.OpenFile(os.Args[1], os.O_RDWR, info.Mode())
+		if err != nil {
+			panic(err)
+		}
+	} else if info.Mode()&os.ModeSocket != 0 {
+		c, err = net.Dial("unix", os.Args[1])
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	defer c.Close()
 
-	out := serialize(m, data)
-	_, err = c.Write(out)
+	_, err = c.Write(data)
 	if err != nil {
 		panic(err)
 	}
@@ -196,30 +294,9 @@ func processWebsocketIncoming(conn *websocket.Conn, closed chan bool) {
 	closed <- true
 }
 
-func attach(termFile *os.File) {
-	u, err := user.Current()
-	if err != nil {
-		panic(err)
-	}
-	m := new(screenMessage)
-	m.ProtocolRevision = msgRevision
-	m.Type = msgAttach
-	copy(m.Mtty[:], []byte(termFile.Name()))
-	m.Mtty[len(termFile.Name())] = 0
-	attach := screenMessageAttach{
-		Apid:        int32(os.Getpid()),
-		Esc:         -1,
-		MetaEsc:     -1,
-		Detachfirst: msgAttach,
-		Adaptflag:   0,
-		Lines:       50,
-		Columns:     132,
-	}
-	copy(attach.Auser[:], []byte(u.Username))
-	attach.Auser[len(u.Name)] = 0
-	copy(attach.Envterm[:], []byte(term))
-	attach.Envterm[len(term)] = 0
-	write(m, attach)
+func attach(termFile *os.File, version int) {
+	m := makeAttachMessage(version, termFile.Name(), 132, 50)
+	screenSocketWrite(m)
 }
 
 func url() string {
@@ -280,12 +357,30 @@ func main() {
 	go signalHandler(ch, termFile, cont, closed)
 
 	fmt.Printf("Attaching to screen %s...\n", os.Args[1])
-	attach(termFile)
-	<-cont
-	fmt.Printf("Attached\n")
+	// try every version in order
+	version := 5
+	found := false
+	for !found {
+		if version < 0 {
+			fmt.Printf("Could not negotiate a version\n")
+			os.Exit(1)
+		}
+		fmt.Printf("Trying version %d\n", version)
+		attach(termFile, version)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-cont:
+			// okay, we're attached
+			found = true
+			break
+		case <-timer.C:
+			// timeout, try the next version
+			version--
+		}
+	}
+	fmt.Printf("Attached with version %d\n", version)
 
 	id := newID()
-
 	conn := newWebSocket(id)
 
 	// wait for a message from the server to know that it is setup
